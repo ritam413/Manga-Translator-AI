@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - E:/u torrentz/manga-projects:/projects
+    environment:
+      - ENGINE_URL=http://engine:8001
+      - PROJECTS_DIR=/projects
+
+  engine:
+    build:
+      context: ../Manga Translator
+    ports:
+      - "8001:8001"
+    volumes:
+      - E:/u torrentz/manga-projects:/projects
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

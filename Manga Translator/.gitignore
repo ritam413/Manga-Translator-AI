@@ -1,0 +1,67 @@
+# ==========================================
+# 1. Python Environment & Caches
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+manga_translator.egg-info/
+venv/
+.venv/
+env/
+
+# ==========================================
+# 2. Machine Learning Models & Caches
+# ==========================================
+# Exclude proprietary translation databases (.json) but KEEP layout models (.pkl)
+assets/models/*.json
+
+# HuggingFace, EasyOCR, and Argos Translate caches
+.hf_cache/
+.easyocr_cache/
+.argos_cache/
+.pip_cache/
+
+# ==========================================
+# 3. Data Inputs, Outputs & User Artifacts
+# ==========================================
+input/
+output/
+!input/.gitkeep
+!output/.gitkeep
+.manga-translator/
+.tmp/
+
+# ==========================================
+# 4. Training Data & Project State
+# ==========================================
+training_data/
+training_data - backup/
+# Exclude dynamic manifest files
+project_manifest.json
+project_manifest.json.bak
+project_manifest.json.tmp
+finetune_model_single_word_v1/
+finetune_model_single_word_v1.zip
+
+# ==========================================
+# 5. Editor & System Configurations
+# ==========================================
+.vscode/
+.cursor/
+.vs/
+.idea/
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+
+# ==========================================
+# 6. AI Assistants & Logs
+# ==========================================
+agent/
+.agents/
+skills-lock.json
+walkthrough.md
+notes.md

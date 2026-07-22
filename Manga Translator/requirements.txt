@@ -1,0 +1,7 @@
+onnxruntime-gpu==1.17.1
+manga-ocr==0.1.11
+easyocr==1.7.1
+deep-translator==1.11.4
+argostranslate==1.11.0
+opencv-python-headless==4.8.1.78
+pillow==10.2.0

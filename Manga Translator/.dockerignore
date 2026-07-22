@@ -1,0 +1,22 @@
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.easyocr_cache
+.hf_cache
+.manga-translator
+.pip_cache
+.pytest_cache
+.vs
+.cursor
+.git
+input
+output
+training_data
+training_data - backup
+finetune_model_single_word_v1.zip
+project_manifest.json
+project_manifest.json.bak
+project_manifest.backup_*
+project_manifest.backup_*.json
