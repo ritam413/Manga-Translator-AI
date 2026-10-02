@@ -36,6 +36,8 @@ try:
 except ImportError:  # pragma: no cover
     GoogleTranslator = None  # type: ignore[assignment]
 
+import re
+
 from core.models import PageManifest, ProjectManifest
 from workers.base import BaseWorker
 
@@ -44,6 +46,62 @@ logger = logging.getLogger("workers.translator")
 # Language codes for the translation pair
 _SRC_LANG = "ja"
 _TGT_LANG = "en"
+
+_COMMON_JA_FALLBACKS = {
+    "その": "That",
+    "この": "This",
+    "あの": "That",
+    "これ": "This",
+    "それ": "That",
+    "あれ": "That",
+    "はい": "Yes",
+    "いいえ": "No",
+    "ああ": "Ah",
+    "あっ": "Ah!",
+    "えっ": "Eh!?",
+    "うん": "Yeah",
+    "ううん": "No",
+    "おっ": "Oh",
+    "はっ": "Ha!",
+    "わっ": "Wah!",
+    "きゃっ": "Kyah!",
+    "ふぅ": "Phew",
+    "へぇ": "Heh",
+    "ほら": "Look",
+    "ねえ": "Hey",
+    "おい": "Hey",
+    "ちょっと": "Wait",
+    "なに": "What",
+    "何": "What",
+    "誰": "Who",
+    "どこ": "Where",
+    "いつ": "When",
+    "どうして": "Why",
+    "なぜ": "Why",
+    "本当": "Really",
+    "マジ": "Seriously",
+    "嘘": "No way",
+    "助けて": "Help",
+    "お願い": "Please",
+    "ありがとう": "Thank you",
+    "ごめん": "Sorry",
+}
+
+
+def is_valid_en_translation(text: Optional[str]) -> bool:
+    """Return True if text contains Latin/ASCII/numeric characters and is not primarily Japanese."""
+    if not text or not text.strip():
+        return False
+    has_ascii_alnum = bool(re.search(r'[a-zA-Z0-9]', text))
+    if not has_ascii_alnum:
+        if re.search(r'^[!?.\s~-]+$', text.strip()):
+            return True
+        return False
+    cjk_count = len(re.findall(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]', text))
+    ascii_count = len(re.findall(r'[a-zA-Z0-9]', text))
+    if cjk_count > ascii_count:
+        return False
+    return True
 
 
 class TranslationWorker(BaseWorker):
@@ -202,14 +260,15 @@ class TranslationWorker(BaseWorker):
             source = "mt"
             if self._tm_db is not None:
                 # Exact match
-                tm_hit = self._tm_db.exact_match(manga_id, region.raw_text)
-                if tm_hit:
+                hit = self._tm_db.exact_match(manga_id, region.raw_text)
+                if hit and is_valid_en_translation(hit):
+                    tm_hit = hit
                     source = "tm_exact"
                 else:
                     # Fuzzy match
                     fuzzy_res = self._tm_db.fuzzy_match(manga_id, region.raw_text, threshold=self._fuzzy_threshold)
-                    if fuzzy_res:
-                        tm_hit, _ = fuzzy_res
+                    if fuzzy_res and is_valid_en_translation(fuzzy_res[0]):
+                        tm_hit = fuzzy_res[0]
                         source = "tm_fuzzy"
 
             if tm_hit is not None:
@@ -231,18 +290,19 @@ class TranslationWorker(BaseWorker):
             region.translated_text = translated
             setattr(region, "translation_source", source)
 
-            if translated == region.raw_text:
-                # Both backends failed — flag for review
+            if translated == region.raw_text or not is_valid_en_translation(translated):
+                # Both backends failed or output is not English — flag for review
                 region.needs_review = True
                 logger.warning(
-                    "[TranslationWorker] Both backends failed for region %s "
-                    "in %s — setting needs_review=True.",
+                    "[TranslationWorker] Translation unresolved or invalid for region %s "
+                    "in %s (translated=%r) — setting needs_review=True.",
                     region.id,
                     page.image_filename,
+                    translated,
                 )
             else:
                 logger.debug(
-                    "[TranslationWorker] %s → %r (source: %s)", region.id, region.translated_text, source
+                    "[TranslationWorker] %s -> %r (source: %s)", region.id, region.translated_text, source
                 )
 
         logger.info(
@@ -284,11 +344,20 @@ class TranslationWorker(BaseWorker):
             )
             if pack_ready:
                 logger.info(
-                    "[TranslationWorker] Argos %s→%s language pack installed.",
+                    "[TranslationWorker] Argos %s->%s language pack installed.",
                     self._source_language,
                     self._target_language,
                 )
                 return True
+
+            # Check local file in cwd or parent
+            for candidate_filename in ("translate-ja_en-1_1.argosmodel", "translate-ja_en.argosmodel"):
+                for search_dir in (".", "..", "assets/models", "../assets/models"):
+                    candidate_path = os.path.join(search_dir, candidate_filename)
+                    if os.path.isfile(candidate_path):
+                        logger.info("[TranslationWorker] Found local Argos model at %s, installing…", candidate_path)
+                        argostranslate.package.install_from_path(os.path.abspath(candidate_path))
+                        return True
 
             if self._install_argos_pkg:
                 logger.info(
@@ -310,21 +379,21 @@ class TranslationWorker(BaseWorker):
                         target_pkg.download()
                     )
                     logger.info(
-                        "[TranslationWorker] Argos %s→%s pack installed.",
+                        "[TranslationWorker] Argos %s->%s pack installed.",
                         self._source_language,
                         self._target_language,
                     )
                     return True
                 else:
                     logger.warning(
-                        "[TranslationWorker] Argos %s→%s pack not in index.",
+                        "[TranslationWorker] Argos %s->%s pack not in index.",
                         self._source_language,
                         self._target_language,
                     )
                     return False
             else:
                 logger.warning(
-                    "[TranslationWorker] Argos %s→%s pack not installed. "
+                    "[TranslationWorker] Argos %s->%s pack not installed. "
                     "Run with install_argos_pkg=True or install manually.",
                     self._source_language,
                     self._target_language,
@@ -372,7 +441,7 @@ class TranslationWorker(BaseWorker):
         for backend_name, backend_fn in backends:
             try:
                 result = backend_fn(text)
-                if result and result.strip():
+                if result and result.strip() and is_valid_en_translation(result):
                     logger.debug(
                         "[TranslationWorker] %s translated via %s",
                         region_id,
@@ -380,9 +449,10 @@ class TranslationWorker(BaseWorker):
                     )
                     return result
                 logger.warning(
-                    "[TranslationWorker] %s: %s returned empty string.",
+                    "[TranslationWorker] %s: %s returned invalid or non-English result: %r",
                     region_id,
                     backend_name,
+                    result,
                 )
             except Exception as exc:
                 logger.warning(
@@ -393,6 +463,13 @@ class TranslationWorker(BaseWorker):
                     image_filename,
                     exc,
                 )
+
+        # Check common fallback dictionary
+        clean_key = text.strip()
+        if clean_key in _COMMON_JA_FALLBACKS:
+            fallback_val = _COMMON_JA_FALLBACKS[clean_key]
+            logger.info("[TranslationWorker] %s translated via common dictionary: %r -> %r", region_id, text, fallback_val)
+            return fallback_val
 
         # Both backends failed — return raw_text (caller sets needs_review)
         return text
@@ -429,7 +506,7 @@ class TranslationWorker(BaseWorker):
                     parts = pattern.split(translated_block)
                     if len(parts) > 1:
                         target_text = parts[-1].strip()
-                        if target_text:
+                        if target_text and is_valid_en_translation(target_text):
                             logger.debug(
                                 "[TranslationWorker] %s translated via %s with context separator",
                                 region_id,
@@ -446,7 +523,7 @@ class TranslationWorker(BaseWorker):
                     
                     if sentences:
                         target_text = sentences[-1].strip()
-                        if target_text:
+                        if target_text and is_valid_en_translation(target_text):
                             logger.debug(
                                 "[TranslationWorker] %s translated via %s with sentence tokenize fallback",
                                 region_id,
@@ -462,9 +539,9 @@ class TranslationWorker(BaseWorker):
                     exc,
                 )
 
-        # Fallback 2: No-context retry on text alone
+        # Fallback 2: Direct translation on text alone
         logger.info(
-            "[TranslationWorker] Context translation failed or yielded empty target for %s. Retrying without context.",
+            "[TranslationWorker] Context translation failed or yielded non-English target for %s. Retrying without context.",
             region_id
         )
         return self._translate_with_fallback(text, region_id, image_filename)

@@ -49,6 +49,7 @@ import numpy as np
 
 from core.models import PageManifest, ProjectManifest, BoundingBox
 from workers.base import BaseWorker
+from workers.translator import is_valid_en_translation
 from quality import (
     BubbleShape, detect_bubble_contour, classify_bubble_shape,
     Tone, score_tone, color_for_speaker
@@ -257,6 +258,14 @@ class TypesetterWorker(BaseWorker):
         for region in page.text_regions:
             if not region.translated_text or not region.translated_text.strip():
                 logger.debug("[TypesetterWorker] Skipping empty region %s", region.id)
+                continue
+
+            if not is_valid_en_translation(region.translated_text):
+                logger.warning(
+                    "[TypesetterWorker] Skipping non-English text in region %s: %r",
+                    region.id,
+                    region.translated_text,
+                )
                 continue
 
             bubble_shape = BubbleShape.UNKNOWN

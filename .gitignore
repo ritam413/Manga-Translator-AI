@@ -1,0 +1,39 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Large Model Binaries (>50MB/100MB)
+*.argosmodel
+*.pt
+*.bin
+*.onnx
+*.safetensors
+*.tar.gz
+*.zip
+
+# Local Cache & Vector DBs
+.hf_cache/
+.easyocr_cache/
+.argos_cache/
+.pip_cache/
+memory/
+.chroma/
+
+# Node & Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

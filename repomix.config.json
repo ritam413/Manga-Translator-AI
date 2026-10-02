@@ -1,0 +1,50 @@
+{
+  "$schema": "https://raw.githubusercontent.com/yamadashy/repomix/main/repomix.config.schema.json",
+  "output": {
+    "filePath": "repomix-output.xml",
+    "style": "xml",
+    "parsableStyle": true,
+    "fileSummary": true,
+    "directoryStructure": true,
+    "topFilesLength": 10
+  },
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "**/node_modules/**",
+      "**/.next/**",
+      "**/.git/**",
+      "**/.venv/**",
+      "**/__pycache__/**",
+      "**/.hf_cache/**",
+      "**/.easyocr_cache/**",
+      "**/.pip_cache/**",
+      "**/.argos_cache/**",
+      "**/.manga-translator/**",
+      "**/.vs/**",
+      "**/.cursor/**",
+      "**/finetune_model_single_word_v1/**",
+      "**/training_data/**",
+      "**/training_data - backup/**",
+      "**/input/**",
+      "**/output/**",
+      "**/*.zip",
+      "**/*.bin",
+      "**/*.pt",
+      "**/*.pth",
+      "**/*.onnx",
+      "**/*.pkl",
+      "**/*.ttf",
+      "**/*.otf",
+      "**/*.woff*",
+      "**/*.jsonl",
+      "**/*.log",
+      "**/project_manifest.json*",
+      "**/package-lock.json",
+      "**/skills-lock.json",
+      "**/memory/**",
+      "repomix-output.*"
+    ]
+  }
+}

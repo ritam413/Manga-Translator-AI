@@ -61,6 +61,24 @@ class OcrWorker(BaseWorker):
             raise ImportError(
                 "manga-ocr is not installed. Run: pip install manga-ocr==0.1.11"
             )
+        try:
+            import manga_ocr.ocr
+            import transformers
+            if hasattr(transformers, "AutoImageProcessor"):
+                # If manga_ocr.ocr.AutoFeatureExtractor is still the old class, patch from_pretrained fallback
+                orig_afp = getattr(manga_ocr.ocr, "AutoFeatureExtractor", None)
+                if orig_afp is not None and not hasattr(orig_afp, "_patched_for_manga_ocr"):
+                    orig_from_pretrained = orig_afp.from_pretrained
+                    def _safe_from_pretrained(*args, **kwargs):
+                        try:
+                            return orig_from_pretrained(*args, **kwargs)
+                        except Exception:
+                            return transformers.AutoImageProcessor.from_pretrained(*args, **kwargs)
+                    orig_afp.from_pretrained = _safe_from_pretrained
+                    orig_afp._patched_for_manga_ocr = True
+        except Exception as patch_err:
+            logger.debug("[OcrWorker] AutoFeatureExtractor patch skipped/failed: %s", patch_err)
+
         self._mocr = MangaOcr()
         self._loaded = True
         logger.info("[OcrWorker] MangaOcr model ready.")
@@ -125,7 +143,7 @@ class OcrWorker(BaseWorker):
                     region.raw_text = text
                     
                 region.ocr_confidence = 1.0    # sentinel: processed by MangaOCR
-                logger.debug("[OcrWorker] %s → %r", region.id, region.raw_text)
+                logger.debug("[OcrWorker] %s -> %r", region.id, region.raw_text)
             except Exception as e:
                 logger.warning(
                     "[OcrWorker] Failed to OCR region %s in %s: %s",
