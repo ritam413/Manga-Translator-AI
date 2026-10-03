@@ -10,7 +10,7 @@ The application consists of three decoupled communicating services:
    - Core ML processing pipeline executing modular stages:
      - `detect-text`: Text detection & bounding box discovery via EasyOCR.
      - `ocr`: Japanese text transcription via MangaOCR.
-     - `translate`: Offline translation via ArgosTranslate or cloud translation (Google/DeepL/OpenAI/Claude).
+     - `translate`: Local LLM batch translation via Ollama (`qwen2.5-3b-instruct-abliterated`), cross-page rolling dialogue buffer, Translation Memory glossary injection, ArgosTranslate (offline), and GoogleTranslator fallback.
      - `inpaint`: Background reconstruction using OpenCV / inpainting methods.
      - `typeset`: Font sizing, wrapping, alignment, and rendering English text into balloons.
    - Exposes REST endpoints via FastAPI in `engine_api.py`.
@@ -61,7 +61,7 @@ Browser (localhost:3000)
 - **Languages**: Python 3.10+, TypeScript, JavaScript.
 - **Backend Frameworks**: FastAPI, Uvicorn, Pydantic.
 - **Frontend Frameworks**: Next.js, React, Tailwind CSS, Lucide icons.
-- **AI/ML & Vision**: EasyOCR, MangaOCR, PyTorch, OpenCV, ArgosTranslate, Transformers.
+- **AI/ML & Vision**: Ollama (`qwen2.5-3b-instruct-abliterated`), EasyOCR, MangaOCR, PyTorch, OpenCV, ArgosTranslate, Transformers.
 - **Packaging/Tooling**: Repomix, npm, PowerShell scripts (`start.ps1`).
 
 ## Data Flow

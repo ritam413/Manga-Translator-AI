@@ -17,8 +17,12 @@ StageController must be constructed with marks_phase="a" — this is the
 stage that sets phase_a_completed = True after all regions are translated.
 """
 
+import json
 import logging
 import os
+import re
+import urllib.error
+import urllib.request
 from typing import Optional
 
 # ── Offline backend: argostranslate ──────────────────────────────────────────
@@ -35,8 +39,6 @@ try:
     from deep_translator import GoogleTranslator
 except ImportError:  # pragma: no cover
     GoogleTranslator = None  # type: ignore[assignment]
-
-import re
 
 from core.models import PageManifest, ProjectManifest
 from workers.base import BaseWorker
@@ -138,6 +140,9 @@ class TranslationWorker(BaseWorker):
         tm_db: Optional[object] = None,
         fuzzy_threshold: float = 0.8,
         context_limit: int = 5,
+        ollama_url: str = "http://localhost:11434",
+        ollama_model: str = "richardyoung/qwen2.5-3b-instruct-abliterated:latest",
+        backend: str = "auto",  # "auto", "ollama", "tm", "google", "argos"
     ) -> None:
         self._source_language = source_language
         self._target_language = target_language
@@ -146,9 +151,17 @@ class TranslationWorker(BaseWorker):
         self._tm_db = tm_db
         self._fuzzy_threshold = fuzzy_threshold
         self._context_limit = context_limit
+        self._ollama_url = ollama_url
+        self._ollama_model = ollama_model
+        self._backend = backend
+
+        # Rolling dialogue memory buffer (for cross-page 100-page consistency)
+        self._rolling_dialogue: list[tuple[str, str]] = []
+        self._max_rolling_context: int = 8
 
         # Runtime state
-        self._argos_available: bool = False   # True when ja→en pack is ready
+        self._ollama_available: bool = False  # True when Ollama server & model match
+        self._argos_available: bool = False   # True when ja->en pack is ready
         self._google_available: bool = False  # True when GoogleTranslator importable
         self._loaded: bool = False
 
@@ -163,8 +176,9 @@ class TranslationWorker(BaseWorker):
         Validate translation backends. Idempotent — safe to call twice.
 
         Checks:
+          - Ollama server connectivity & model discovery (/api/tags).
           - argostranslate is importable AND the required language pack is
-            installed.  If install_argos_pkg=True and the pack is absent,
+            installed. If install_argos_pkg=True and the pack is absent,
             downloads and installs it automatically.
           - GoogleTranslator is importable as an online fallback.
 
@@ -176,11 +190,27 @@ class TranslationWorker(BaseWorker):
 
         logger.info(
             "[TranslationWorker] Initialising translation backends "
-            "(src=%s tgt=%s prefer_offline=%s)…",
+            "(src=%s tgt=%s backend=%s prefer_offline=%s)…",
             self._source_language,
             self._target_language,
+            self._backend,
             self._prefer_offline,
         )
+
+        # ── 0. Check Ollama ───────────────────────────────────────────────────
+        if self._backend in ("auto", "ollama"):
+            self._ollama_available = self._probe_ollama()
+            if self._ollama_available:
+                logger.info(
+                    "[TranslationWorker] Ollama backend active (model=%s, url=%s).",
+                    self._ollama_model,
+                    self._ollama_url,
+                )
+            elif self._backend == "ollama":
+                logger.warning(
+                    "[TranslationWorker] Ollama requested as backend, but probe failed at %s.",
+                    self._ollama_url,
+                )
 
         # ── 1. Check argostranslate ───────────────────────────────────────────
         if argostranslate is not None:
@@ -204,15 +234,16 @@ class TranslationWorker(BaseWorker):
             self._google_available = False
 
         # ── 3. Require at least one backend ──────────────────────────────────
-        if not self._argos_available and not self._google_available:
+        if not self._ollama_available and not self._argos_available and not self._google_available:
             raise RuntimeError(
                 "TranslationWorker: no translation backend is available. "
-                "Install argostranslate==1.11.0 or deep-translator==1.11.4."
+                "Ensure Ollama is running, or install argostranslate/deep-translator."
             )
 
         self._loaded = True
         logger.info(
-            "[TranslationWorker] Ready — argos=%s google=%s.",
+            "[TranslationWorker] Ready — ollama=%s argos=%s google=%s.",
+            self._ollama_available,
             self._argos_available,
             self._google_available,
         )
@@ -225,15 +256,11 @@ class TranslationWorker(BaseWorker):
         """
         Translate every TextRegion on the page.
 
-        For each region:
-          1. Skip if raw_text is empty (nothing to translate).
-          2. Attempt translation via the preferred backend, then the other.
-          3. Write result to region.translated_text.
-          4. If both backends fail: set translated_text = raw_text and
-             needs_review = True (never raise from within the region loop).
-
-        Returns the mutated PageManifest (same object).
-        Must NOT write to disk.
+        1. Filter non-empty regions.
+        2. Attempt fast Page-Level JSON Batch Translation via Ollama if available.
+        3. For any missing/invalid regions or if Ollama is unavailable,
+           fall back to TM matches followed by per-region MT backends.
+        4. Mutates and returns the PageManifest.
         """
         if not self._loaded:
             raise RuntimeError(
@@ -246,52 +273,63 @@ class TranslationWorker(BaseWorker):
             page.image_filename,
         )
 
+        valid_regions = [r for r in page.text_regions if r.raw_text and r.raw_text.strip()]
+        if not valid_regions:
+            return page
+
         manga_id = getattr(manifest, "manga_id", "") or getattr(manifest, "project_name", "") or "default"
 
-        for region in page.text_regions:
-            if not region.raw_text or not region.raw_text.strip():
-                logger.debug(
-                    "[TranslationWorker] Skipping empty region %s", region.id
-                )
-                continue
-
-            # 1. Check Translation Memory
-            tm_hit = None
-            source = "mt"
-            if self._tm_db is not None:
-                # Exact match
+        # 1. Check exact TM hits first
+        tm_exact_map: dict[str, str] = {}
+        if self._tm_db is not None:
+            for region in valid_regions:
                 hit = self._tm_db.exact_match(manga_id, region.raw_text)
                 if hit and is_valid_en_translation(hit):
-                    tm_hit = hit
-                    source = "tm_exact"
-                else:
-                    # Fuzzy match
+                    tm_exact_map[region.id] = hit
+
+        # 2. Try Page-Level JSON Batch Translation via Ollama for remaining regions
+        ollama_batch_map: dict[str, str] = {}
+        regions_for_ollama = [r for r in valid_regions if r.id not in tm_exact_map]
+
+        if self._ollama_available and self._backend in ("auto", "ollama") and regions_for_ollama:
+            batch_input = {r.id: r.raw_text for r in regions_for_ollama}
+            ollama_batch_map = self._translate_page_batch_ollama(batch_input, manga_id=manga_id)
+
+        # 3. Assign translations and run fallbacks for unresolved regions
+        for region in page.text_regions:
+            if not region.raw_text or not region.raw_text.strip():
+                continue
+
+            translated: Optional[str] = None
+            source: str = "mt"
+
+            if region.id in tm_exact_map:
+                translated = tm_exact_map[region.id]
+                source = "tm_exact"
+                logger.info("[TranslationWorker] TM exact hit for %s: %r -> %r", region.id, region.raw_text, translated)
+            elif region.id in ollama_batch_map and is_valid_en_translation(ollama_batch_map[region.id]):
+                translated = ollama_batch_map[region.id]
+                source = "ollama_batch"
+                logger.debug("[TranslationWorker] Ollama batch hit for %s: %r -> %r", region.id, region.raw_text, translated)
+            else:
+                # Check fuzzy TM match
+                if self._tm_db is not None:
                     fuzzy_res = self._tm_db.fuzzy_match(manga_id, region.raw_text, threshold=self._fuzzy_threshold)
                     if fuzzy_res and is_valid_en_translation(fuzzy_res[0]):
-                        tm_hit = fuzzy_res[0]
+                        translated = fuzzy_res[0]
                         source = "tm_fuzzy"
+                        logger.info("[TranslationWorker] TM fuzzy hit for %s: %r -> %r", region.id, region.raw_text, translated)
 
-            if tm_hit is not None:
-                translated = tm_hit
-                logger.info("[TranslationWorker] TM hit (%s) for %s: %r -> %r", source, region.id, region.raw_text, translated)
-            else:
-                # 2. Build context prefix and call context translation helper
-                page_num = getattr(page, "page_number", 0)
-                region_idx = getattr(region, "region_index", 0)
-                
-                from finetuning.pipeline_integration import build_story_position, build_context_prefix
-                story_pos = build_story_position(manga_id, page_num, region_idx)
-                context_prefix = build_context_prefix(self._tm_db, manga_id, story_pos, limit=self._context_limit)
-                
-                translated = self._translate_with_context_fallback(
-                    context_prefix, region.raw_text, region.id, page.image_filename
-                )
+                # Fallback to single region translation (clean sentence, no delimiter injection)
+                if translated is None:
+                    translated = self._translate_with_clean_fallback(
+                        region.raw_text, region.id, page.image_filename
+                    )
 
             region.translated_text = translated
             setattr(region, "translation_source", source)
 
             if translated == region.raw_text or not is_valid_en_translation(translated):
-                # Both backends failed or output is not English — flag for review
                 region.needs_review = True
                 logger.warning(
                     "[TranslationWorker] Translation unresolved or invalid for region %s "
@@ -305,6 +343,20 @@ class TranslationWorker(BaseWorker):
                     "[TranslationWorker] %s -> %r (source: %s)", region.id, region.translated_text, source
                 )
 
+        # 4. Update rolling dialogue FIFO buffer for cross-page dialogue consistency
+        for region in page.text_regions:
+            if (
+                region.raw_text
+                and region.raw_text.strip()
+                and region.translated_text
+                and is_valid_en_translation(region.translated_text)
+                and region.translated_text.strip() != region.raw_text.strip()
+            ):
+                self._rolling_dialogue.append((region.raw_text.strip(), region.translated_text.strip()))
+
+        if len(self._rolling_dialogue) > self._max_rolling_context:
+            self._rolling_dialogue = self._rolling_dialogue[-self._max_rolling_context:]
+
         logger.info(
             "[TranslationWorker] Finished page: %s", page.image_filename
         )
@@ -313,13 +365,13 @@ class TranslationWorker(BaseWorker):
     def unload(self) -> None:
         """
         Release worker state. Idempotent.
-        (No heavy models to release — argostranslate & deep_translator are
-        stateless library calls, not persistent in-memory objects.)
         """
         if not self._loaded:
             logger.info("[TranslationWorker] Already unloaded — skipping.")
             return
         logger.info("[TranslationWorker] Unloading…")
+        self._rolling_dialogue.clear()
+        self._ollama_available = False
         self._argos_available = False
         self._google_available = False
         self._loaded = False
@@ -329,6 +381,206 @@ class TranslationWorker(BaseWorker):
         return self._loaded
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _probe_ollama(self) -> bool:
+        """Non-blocking probe checking if Ollama server and target model are available."""
+        try:
+            req = urllib.request.Request(
+                f"{self._ollama_url.rstrip('/')}/api/tags",
+                headers={"User-Agent": "MangaTranslator"},
+            )
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    models = [m.get("name", "") for m in data.get("models", [])]
+                    matched = any(
+                        self._ollama_model in m
+                        or m in self._ollama_model
+                        or "qwen2.5" in m
+                        for m in models
+                    )
+                    if matched or models:
+                        logger.info(
+                            "[TranslationWorker] Ollama probe succeeded. Available models: %s",
+                            models,
+                        )
+                        return True
+        except Exception as exc:
+            logger.debug("[TranslationWorker] Ollama probe failed: %s", exc)
+            return False
+        return False
+
+    def _generate_ollama(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        format_json: bool = False,
+        timeout: float = 60.0,
+    ) -> Optional[str]:
+        """
+        Send inference request to Ollama `/api/generate`.
+        Returns raw text response or None on failure.
+        """
+        payload = {
+            "model": self._ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.2,
+                "repeat_penalty": 1.15,
+            },
+        }
+        if system:
+            payload["system"] = system
+        if format_json:
+            payload["format"] = "json"
+
+        try:
+            req = urllib.request.Request(
+                f"{self._ollama_url.rstrip('/')}/api/generate",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "MangaTranslator",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    res_data = json.loads(resp.read().decode("utf-8"))
+                    return res_data.get("response", "")
+        except Exception as exc:
+            logger.warning("[TranslationWorker] Ollama generation failed: %s", exc)
+            return None
+        return None
+
+    def _build_ollama_prompt(
+        self, batch_input: dict[str, str], manga_id: str = "default"
+    ) -> str:
+        """
+        Assemble contextual localization prompt with series glossary and rolling dialogue history.
+        """
+        # 1. Extract active glossary terms
+        glossary_items: list[str] = []
+        if self._tm_db is not None:
+            if hasattr(self._tm_db, "get_glossary"):
+                glossary = self._tm_db.get_glossary(manga_id, limit=12)
+                for jp, en in glossary.items():
+                    glossary_items.append(f"- {jp} -> {en}")
+            elif hasattr(self._tm_db, "manga_vocab") and manga_id in self._tm_db.manga_vocab:
+                for jp, en in list(self._tm_db.manga_vocab[manga_id].items())[:12]:
+                    glossary_items.append(f"- {jp} -> {en}")
+
+        prompt_sections = [
+            "You are an expert Japanese-to-English manga localizer and translator.",
+            "Translate each Japanese dialogue entry into natural, expressive ENGLISH.",
+            "Rules:",
+            "- Output MUST be in English only (NO Japanese, NO Chinese).",
+            "- Maintain consistent character names, pronouns, honorifics, and speaking styles.",
+            "- Preserve manga character nuances, colloquialisms, and punctuation.",
+            "- Return ONLY a valid JSON object mapping each region ID key to its translated English string value.",
+        ]
+
+        if glossary_items:
+            prompt_sections.append("\nSeries Glossary (Character Names & Key Terminology):")
+            prompt_sections.extend(glossary_items)
+
+        if self._rolling_dialogue:
+            prompt_sections.append("\nRecent Dialogue Context (Chronological Flow):")
+            for jp, en in self._rolling_dialogue[-self._max_rolling_context:]:
+                prompt_sections.append(f"- JP: {jp} | EN: {en}")
+
+        prompt_sections.append("\nInput Dialogue Blocks to Translate (JSON):")
+        prompt_sections.append(json.dumps(batch_input, ensure_ascii=False, indent=2))
+        prompt_sections.append("\nOutput JSON (English):")
+
+        return "\n".join(prompt_sections)
+
+    def _translate_page_batch_ollama(
+        self,
+        batch_input: dict[str, str],
+        manga_id: str = "default",
+    ) -> dict[str, str]:
+        """
+        Translate a dictionary of {region_id: raw_ja_text} via Ollama in a single JSON pass.
+        Returns a dict of {region_id: translated_en_text}.
+        """
+        if not batch_input:
+            return {}
+
+        prompt = self._build_ollama_prompt(batch_input, manga_id=manga_id)
+        system = "You are a professional Japanese to English manga translator. Translate all dialogue into natural English. Always reply with valid JSON only."
+
+        raw_response = self._generate_ollama(prompt=prompt, system=system, format_json=True, timeout=60.0)
+        if not raw_response:
+            # Fallback retry without format_json in case strict format mode fails
+            raw_response = self._generate_ollama(prompt=prompt, system=system, format_json=False, timeout=60.0)
+
+        if not raw_response:
+            logger.warning("[TranslationWorker] Ollama batch translation returned empty response.")
+            return {}
+
+        parsed = self._parse_json_batch_response(raw_response)
+        logger.info(
+            "[TranslationWorker] Ollama batch translated %d/%d regions successfully.",
+            len(parsed),
+            len(batch_input),
+        )
+        return parsed
+
+    @staticmethod
+    def _parse_json_batch_response(text: str) -> dict[str, str]:
+        """
+        4-tier robust JSON response parser:
+          Tier 1: Direct json.loads
+          Tier 2: Markdown code fence extraction (```json ... ```)
+          Tier 3: First '{' to last '}' boundary extraction
+          Tier 4: Line-by-line regex key-value extraction
+        """
+        if not text or not text.strip():
+            return {}
+
+        clean_text = text.strip()
+
+        # Tier 1: Direct JSON parse
+        try:
+            data = json.loads(clean_text)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items() if v is not None}
+        except Exception:
+            pass
+
+        # Tier 2: Markdown code fence block
+        code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', clean_text, re.DOTALL)
+        if code_block_match:
+            try:
+                data = json.loads(code_block_match.group(1).strip())
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items() if v is not None}
+            except Exception:
+                pass
+
+        # Tier 3: Substring between first '{' and last '}'
+        start_idx = clean_text.find('{')
+        end_idx = clean_text.rfind('}')
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            substring = clean_text[start_idx : end_idx + 1]
+            try:
+                data = json.loads(substring)
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items() if v is not None}
+            except Exception:
+                pass
+
+        # Tier 4: Regex key-value extraction (matching delimiter quote pair with backreference)
+        result = {}
+        kv_pattern = re.compile(r'["\']([a-zA-Z0-9_.-]+)["\']\s*:\s*(["\'])(.*?)\2')
+        for match in kv_pattern.finditer(clean_text):
+            k, v = match.group(1), match.group(3)
+            if k and v is not None:
+                result[k] = v.strip()
+
+        return result
 
     def _check_or_install_argos_pack(self) -> bool:
         """
@@ -350,47 +602,50 @@ class TranslationWorker(BaseWorker):
                 )
                 return True
 
-            # Check local file in cwd or parent
-            for candidate_filename in ("translate-ja_en-1_1.argosmodel", "translate-ja_en.argosmodel"):
-                for search_dir in (".", "..", "assets/models", "../assets/models"):
-                    candidate_path = os.path.join(search_dir, candidate_filename)
-                    if os.path.isfile(candidate_path):
-                        logger.info("[TranslationWorker] Found local Argos model at %s, installing…", candidate_path)
-                        argostranslate.package.install_from_path(os.path.abspath(candidate_path))
-                        return True
-
             if self._install_argos_pkg:
                 logger.info(
                     "[TranslationWorker] Argos pack not found — downloading…"
                 )
-                argostranslate.package.update_package_index()
-                available = argostranslate.package.get_available_packages()
-                target_pkg = next(
-                    (
-                        p
-                        for p in available
-                        if p.from_code == self._source_language
-                        and p.to_code == self._target_language
-                    ),
-                    None,
+                try:
+                    argostranslate.package.update_package_index()
+                    available = argostranslate.package.get_available_packages()
+                    target_pkg = next(
+                        (
+                            p
+                            for p in available
+                            if p.from_code == self._source_language
+                            and p.to_code == self._target_language
+                        ),
+                        None,
+                    )
+                    if target_pkg:
+                        argostranslate.package.install_from_path(
+                            target_pkg.download()
+                        )
+                        logger.info(
+                            "[TranslationWorker] Argos %s->%s pack installed.",
+                            self._source_language,
+                            self._target_language,
+                        )
+                        return True
+                except Exception as exc:
+                    logger.warning("[TranslationWorker] Argos package index download failed: %s", exc)
+
+                # Fallback: Check local candidate file in cwd or parent
+                for candidate_filename in ("translate-ja_en-1_1.argosmodel", "translate-ja_en.argosmodel"):
+                    for search_dir in (".", "..", "assets/models", "../assets/models"):
+                        candidate_path = os.path.join(search_dir, candidate_filename)
+                        if os.path.isfile(candidate_path):
+                            logger.info("[TranslationWorker] Found local Argos model at %s, installing…", candidate_path)
+                            argostranslate.package.install_from_path(os.path.abspath(candidate_path))
+                            return True
+
+                logger.warning(
+                    "[TranslationWorker] Argos %s->%s pack not in index.",
+                    self._source_language,
+                    self._target_language,
                 )
-                if target_pkg:
-                    argostranslate.package.install_from_path(
-                        target_pkg.download()
-                    )
-                    logger.info(
-                        "[TranslationWorker] Argos %s->%s pack installed.",
-                        self._source_language,
-                        self._target_language,
-                    )
-                    return True
-                else:
-                    logger.warning(
-                        "[TranslationWorker] Argos %s->%s pack not in index.",
-                        self._source_language,
-                        self._target_language,
-                    )
-                    return False
+                return False
             else:
                 logger.warning(
                     "[TranslationWorker] Argos %s->%s pack not installed. "
@@ -419,6 +674,15 @@ class TranslationWorker(BaseWorker):
         )
         return translator.translate(text)
 
+    def _translate_with_clean_fallback(
+        self, text: str, region_id: str, image_filename: str
+    ) -> str:
+        """
+        Translate isolated clean sentence with neural MT backends (NO delimiter injections).
+        Prevents repetition loops caused by multi-line context delimiters in Seq2Seq models.
+        """
+        return self._translate_with_fallback(text, region_id, image_filename)
+
     def _translate_with_fallback(
         self, text: str, region_id: str, image_filename: str
     ) -> str:
@@ -426,6 +690,36 @@ class TranslationWorker(BaseWorker):
         Try preferred backend first, then fallback, then return raw_text.
         Returns the translated string (or raw_text if both fail).
         """
+        clean_text = text.strip() if text else ""
+        if not clean_text:
+            return text
+
+        # Check common fallback dictionary
+        if clean_text in _COMMON_JA_FALLBACKS:
+            fallback_val = _COMMON_JA_FALLBACKS[clean_text]
+            logger.info("[TranslationWorker] %s translated via common dictionary: %r -> %r", region_id, text, fallback_val)
+            return fallback_val
+
+        # If Ollama is available, try single prompt generation before MT backends
+        if self._ollama_available and self._backend in ("auto", "ollama"):
+            try:
+                single_prompt = (
+                    "You are an expert manga translator. Translate this Japanese dialogue to natural English:\n"
+                    f"{clean_text}\n"
+                    "Output ONLY the English translation without explanation or quotes:"
+                )
+                ollama_res = self._generate_ollama(prompt=single_prompt, timeout=20.0)
+                if ollama_res and ollama_res.strip() and is_valid_en_translation(ollama_res.strip()):
+                    cleaned_res = ollama_res.strip().strip('"').strip("'")
+                    logger.debug(
+                        "[TranslationWorker] %s single fallback translated via Ollama: %r",
+                        region_id,
+                        cleaned_res,
+                    )
+                    return cleaned_res
+            except Exception as exc:
+                logger.debug("[TranslationWorker] Single Ollama fallback failed: %s", exc)
+
         backends = []
         if self._prefer_offline:
             if self._argos_available:
@@ -440,7 +734,7 @@ class TranslationWorker(BaseWorker):
 
         for backend_name, backend_fn in backends:
             try:
-                result = backend_fn(text)
+                result = backend_fn(clean_text)
                 if result and result.strip() and is_valid_en_translation(result):
                     logger.debug(
                         "[TranslationWorker] %s translated via %s",
@@ -464,84 +758,11 @@ class TranslationWorker(BaseWorker):
                     exc,
                 )
 
-        # Check common fallback dictionary
-        clean_key = text.strip()
-        if clean_key in _COMMON_JA_FALLBACKS:
-            fallback_val = _COMMON_JA_FALLBACKS[clean_key]
-            logger.info("[TranslationWorker] %s translated via common dictionary: %r -> %r", region_id, text, fallback_val)
-            return fallback_val
-
         # Both backends failed — return raw_text (caller sets needs_review)
         return text
 
     def _translate_with_context_fallback(
         self, context_prefix: str, text: str, region_id: str, image_filename: str
     ) -> str:
-        """Translate text with prepended context, then extract target sentence."""
-        if not context_prefix:
-            return self._translate_with_fallback(text, region_id, image_filename)
-
-        from finetuning.pipeline_integration import prepend_context
-        query = prepend_context(context_prefix, text)
-
-        backends = []
-        if self._prefer_offline:
-            if self._argos_available:
-                backends.append(("argostranslate", self._translate_via_argos))
-            if self._google_available:
-                backends.append(("GoogleTranslator", self._translate_via_google))
-        else:
-            if self._google_available:
-                backends.append(("GoogleTranslator", self._translate_via_google))
-            if self._argos_available:
-                backends.append(("argostranslate", self._translate_via_argos))
-
-        for backend_name, backend_fn in backends:
-            try:
-                translated_block = backend_fn(query)
-                if translated_block and translated_block.strip():
-                    import re
-                    # Match variations of separator dashes or vertical bars
-                    pattern = re.compile(r'(?:\n-+\n|\n\|{3,}\n|---)')
-                    parts = pattern.split(translated_block)
-                    if len(parts) > 1:
-                        target_text = parts[-1].strip()
-                        if target_text and is_valid_en_translation(target_text):
-                            logger.debug(
-                                "[TranslationWorker] %s translated via %s with context separator",
-                                region_id,
-                                backend_name,
-                            )
-                            return target_text
-                            
-                    # Fallback 1: Sentence tokenization
-                    try:
-                        import nltk
-                        sentences = nltk.tokenize.sent_tokenize(translated_block)
-                    except Exception:
-                        sentences = [s.strip() for s in re.split(r'(?<=[.!?。！？])\s+', translated_block) if s.strip()]
-                    
-                    if sentences:
-                        target_text = sentences[-1].strip()
-                        if target_text and is_valid_en_translation(target_text):
-                            logger.debug(
-                                "[TranslationWorker] %s translated via %s with sentence tokenize fallback",
-                                region_id,
-                                backend_name,
-                            )
-                            return target_text
-            except Exception as exc:
-                logger.warning(
-                    "[TranslationWorker] %s with context failed for %s in %s: %s",
-                    backend_name,
-                    region_id,
-                    image_filename,
-                    exc,
-                )
-
-        # Fallback 2: Direct translation on text alone
-        logger.info(
-            "[TranslationWorker] Context translation failed or yielded non-English target for %s. Retrying without context.",
-            region_id
-        )
-        return self._translate_with_fallback(text, region_id, image_filename)
+        """Deprecated: forwards directly to clean fallback to prevent Seq2Seq repetition loops."""
+        return self._translate_with_clean_fallback(text, region_id, image_filename)

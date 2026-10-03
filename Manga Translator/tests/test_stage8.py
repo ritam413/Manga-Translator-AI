@@ -115,7 +115,8 @@ class TestTranslationWorkerLoad(unittest.TestCase):
 
     @patch("workers.translator.argostranslate", new=None)
     @patch("workers.translator.GoogleTranslator", new=None)
-    def test_load_no_backends_raises(self):
+    @patch.object(TranslationWorker, "_probe_ollama", return_value=False)
+    def test_load_no_backends_raises(self, mock_probe):
         """No backends at all → RuntimeError."""
         worker = TranslationWorker()
         with self.assertRaises(RuntimeError):
@@ -561,7 +562,223 @@ class TestStageControllerIntegration(unittest.TestCase):
         self.assertEqual(engine.save_manifest.call_count, 2)
 
 
+
+# ── 6. Ollama Client & Health Probe (Ticket 1) ────────────────────────────────
+
+class TestOllamaClient(unittest.TestCase):
+
+    @patch("urllib.request.urlopen")
+    def test_probe_ollama_success(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b'{"models": [{"name": "richardyoung/qwen2.5-3b-instruct-abliterated:latest"}]}'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        worker = TranslationWorker()
+        self.assertTrue(worker._probe_ollama())
+
+    @patch("urllib.request.urlopen")
+    def test_probe_ollama_failure(self, mock_urlopen):
+        mock_urlopen.side_effect = Exception("Connection refused")
+        worker = TranslationWorker()
+        self.assertFalse(worker._probe_ollama())
+
+    @patch("urllib.request.urlopen")
+    def test_generate_ollama_success(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b'{"response": "Hello world"}'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        worker = TranslationWorker()
+        res = worker._generate_ollama("Translate: こんにちは")
+        self.assertEqual(res, "Hello world")
+
+    @patch("urllib.request.urlopen")
+    def test_generate_ollama_failure(self, mock_urlopen):
+        mock_urlopen.side_effect = Exception("Timeout")
+        worker = TranslationWorker()
+        res = worker._generate_ollama("Translate: こんにちは")
+        self.assertIsNone(res)
+
+
+
+# ── 7. Page-Level JSON Batch Prompt & Multi-Tier Parser (Ticket 2) ─────────────
+
+class TestOllamaBatchTranslation(unittest.TestCase):
+
+    def test_parse_json_tier1_direct(self):
+        raw = '{"r0000": "Hello", "r0001": "World"}'
+        parsed = TranslationWorker._parse_json_batch_response(raw)
+        self.assertEqual(parsed, {"r0000": "Hello", "r0001": "World"})
+
+    def test_parse_json_tier2_markdown(self):
+        raw = 'Here is your output:\n```json\n{"r0000": "Good morning", "r0001": "Everyone"}\n```\nEnjoy!'
+        parsed = TranslationWorker._parse_json_batch_response(raw)
+        self.assertEqual(parsed, {"r0000": "Good morning", "r0001": "Everyone"})
+
+    def test_parse_json_tier3_substring(self):
+        raw = 'Leading text {"r0000": "See you later"} trailing text'
+        parsed = TranslationWorker._parse_json_batch_response(raw)
+        self.assertEqual(parsed, {"r0000": "See you later"})
+
+    def test_parse_json_tier4_regex(self):
+        raw = 'Malformed json with no outer braces: "r0000": "Wait", "r0001": "Stop"'
+        parsed = TranslationWorker._parse_json_batch_response(raw)
+        self.assertEqual(parsed.get("r0000"), "Wait")
+        self.assertEqual(parsed.get("r0001"), "Stop")
+
+    def test_parse_json_empty_or_none(self):
+        self.assertEqual(TranslationWorker._parse_json_batch_response(""), {})
+        self.assertEqual(TranslationWorker._parse_json_batch_response(None), {})
+
+    @patch.object(TranslationWorker, "_generate_ollama")
+    def test_translate_page_batch_ollama_success(self, mock_gen):
+        mock_gen.return_value = '{"r0000": "Hello", "r0001": "World"}'
+        worker = TranslationWorker()
+        res = worker._translate_page_batch_ollama({"r0000": "こんにちは", "r0001": "世界"})
+        self.assertEqual(res, {"r0000": "Hello", "r0001": "World"})
+
+    @patch.object(TranslationWorker, "_translate_page_batch_ollama")
+    def test_process_page_ollama_batch_flow(self, mock_batch):
+        mock_batch.return_value = {"r0000": "Hello", "r0001": "World"}
+        worker = TranslationWorker(backend="ollama")
+        worker._loaded = True
+        worker._ollama_available = True
+
+        page = _make_page("こんにちは", "世界")
+        manifest = _make_manifest()
+
+        updated_page = worker.process_page(page, manifest)
+        self.assertEqual(updated_page.text_regions[0].translated_text, "Hello")
+        self.assertEqual(getattr(updated_page.text_regions[0], "translation_source", None), "ollama_batch")
+        self.assertEqual(updated_page.text_regions[1].translated_text, "World")
+        self.assertEqual(getattr(updated_page.text_regions[1], "translation_source", None), "ollama_batch")
+
+    @patch.object(TranslationWorker, "_translate_page_batch_ollama")
+    @patch.object(TranslationWorker, "_translate_with_fallback")
+    def test_process_page_ollama_batch_partial_dropped_key_fallback(self, mock_fallback, mock_batch):
+        # Ollama only returned r0000, r0001 was dropped
+        mock_batch.return_value = {"r0000": "Hello"}
+        mock_fallback.return_value = "World Fallback"
+
+        worker = TranslationWorker(backend="ollama")
+        worker._loaded = True
+        worker._ollama_available = True
+
+        page = _make_page("こんにちは", "世界")
+        manifest = _make_manifest()
+
+        updated_page = worker.process_page(page, manifest)
+        self.assertEqual(updated_page.text_regions[0].translated_text, "Hello")
+        self.assertEqual(getattr(updated_page.text_regions[0], "translation_source", None), "ollama_batch")
+        self.assertEqual(updated_page.text_regions[1].translated_text, "World Fallback")
+
+
+
+# ── 8. Rolling Dialogue Buffer & Glossary Memory (Ticket 3) ───────────────────
+
+class TestRollingDialogueAndGlossary(unittest.TestCase):
+
+    def test_build_ollama_prompt_with_glossary_and_history(self):
+        mock_tm = MagicMock()
+        mock_tm.get_glossary.return_value = {"先輩": "Senpai", "勇者": "Hero"}
+
+        worker = TranslationWorker(tm_db=mock_tm)
+        worker._rolling_dialogue = [("おはよう", "Good morning"), ("行くぞ", "Let's go")]
+
+        batch = {"r1": "待って、先輩！"}
+        prompt = worker._build_ollama_prompt(batch, manga_id="test_series")
+
+        self.assertIn("Series Glossary", prompt)
+        self.assertIn("- 先輩 -> Senpai", prompt)
+        self.assertIn("Recent Dialogue Context", prompt)
+        self.assertIn("- JP: おはよう | EN: Good morning", prompt)
+        self.assertIn('"r1": "待って、先輩！"', prompt)
+
+    @patch.object(TranslationWorker, "_translate_page_batch_ollama")
+    def test_rolling_dialogue_populated_across_pages(self, mock_batch):
+        worker = TranslationWorker(backend="ollama")
+        worker._loaded = True
+        worker._ollama_available = True
+
+        mock_batch.return_value = {"r0000": "Good morning", "r0001": "Senpai"}
+        page1 = _make_page("おはよう", "先輩")
+        manifest = _make_manifest()
+        worker.process_page(page1, manifest)
+
+        self.assertEqual(len(worker._rolling_dialogue), 2)
+        self.assertEqual(worker._rolling_dialogue[0], ("おはよう", "Good morning"))
+        self.assertEqual(worker._rolling_dialogue[1], ("先輩", "Senpai"))
+
+        mock_batch.return_value = {"r0000": "Let's go"}
+        page2 = _make_page("行こう")
+        worker.process_page(page2, manifest)
+
+        self.assertEqual(len(worker._rolling_dialogue), 3)
+        self.assertEqual(worker._rolling_dialogue[2], ("行こう", "Let's go"))
+
+    def test_unload_clears_rolling_dialogue(self):
+        worker = TranslationWorker()
+        worker._loaded = True
+        worker._rolling_dialogue = [("おはよう", "Good morning")]
+        worker.unload()
+        self.assertEqual(len(worker._rolling_dialogue), 0)
+
+
+# ── 9. Clean Fallback & CLI Config Integration (Tickets 4 & 5) ───────────────
+
+class TestCleanFallbackAndCliIntegration(unittest.TestCase):
+
+    def test_clean_fallback_direct_call(self):
+        worker = TranslationWorker()
+        worker._loaded = True
+        worker._google_available = True
+
+        with patch.object(worker, "_translate_via_google", return_value="Good morning"):
+            res = worker._translate_with_clean_fallback("おはよう", "r0", "p1.png")
+            self.assertEqual(res, "Good morning")
+
+    def test_clean_fallback_dictionary_match(self):
+        worker = TranslationWorker()
+        worker._loaded = True
+        res = worker._translate_with_clean_fallback("はい", "r0", "p1.png")
+        self.assertEqual(res, "Yes")
+
+    def test_context_fallback_forwards_to_clean_fallback(self):
+        worker = TranslationWorker()
+        worker._loaded = True
+        with patch.object(worker, "_translate_with_clean_fallback", return_value="Forwarded Clean") as mock_clean:
+            res = worker._translate_with_context_fallback("Some Prefix", "テスト", "r0", "p1.png")
+            self.assertEqual(res, "Forwarded Clean")
+            mock_clean.assert_called_once_with("テスト", "r0", "p1.png")
+
+    def test_cli_config_models_translation_settings(self):
+        from cli.config.models import CliConfig, TranslationSettings
+        cfg = CliConfig()
+        self.assertEqual(cfg.translation.backend, "auto")
+        self.assertEqual(cfg.translation.ollama_url, "http://localhost:11434")
+        self.assertIn("qwen2.5", cfg.translation.ollama_model)
+
+    def test_worker_factory_builds_translation_worker_with_ollama(self):
+        from cli.config.models import CliConfig
+        from cli.worker_factory import build_translation_worker
+
+        cfg = CliConfig()
+        cfg.translation.backend = "ollama"
+        cfg.translation.ollama_url = "http://127.0.0.1:11434"
+        cfg.translation.ollama_model = "test-model:latest"
+
+        worker = build_translation_worker(cfg)
+        self.assertEqual(worker._backend, "ollama")
+        self.assertEqual(worker._ollama_url, "http://127.0.0.1:11434")
+        self.assertEqual(worker._ollama_model, "test-model:latest")
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     unittest.main()
+

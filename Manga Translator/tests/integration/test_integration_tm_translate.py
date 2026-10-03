@@ -22,7 +22,7 @@ def test_translation_worker_tm_lookup(mock_google_cls, synthetic_tm_db, manga_id
     mock_google_cls.return_value = mock_google
     mock_google.translate.return_value = "Google translation"
 
-    worker = TranslationWorker(prefer_offline=False, tm_db=synthetic_tm_db, fuzzy_threshold=0.8)
+    worker = TranslationWorker(prefer_offline=False, tm_db=synthetic_tm_db, fuzzy_threshold=0.8, backend="google")
     worker.load()
     
     region = TextRegion(id="r00", box=BoundingBox(10, 10, 50, 50), raw_text=jp_text)
@@ -54,7 +54,7 @@ def test_translation_worker_fuzzy_thresholds(mock_google_cls, synthetic_tm_db, s
     mock_google_cls.return_value = mock_google
     mock_google.translate.return_value = "Google translation"
 
-    worker = TranslationWorker(prefer_offline=False, tm_db=synthetic_tm_db, fuzzy_threshold=similarity_threshold)
+    worker = TranslationWorker(prefer_offline=False, tm_db=synthetic_tm_db, fuzzy_threshold=similarity_threshold, backend="google")
     worker.load()
     
     # "こんにちは！" has ~0.83 similarity to "こんにちは"
@@ -70,60 +70,45 @@ def test_translation_worker_fuzzy_thresholds(mock_google_cls, synthetic_tm_db, s
 
 
 @patch("workers.translator.GoogleTranslator")
-def test_translation_worker_context_prepend_google(mock_google_cls, synthetic_tm_db):
-    """Verify preceding context sentences are prepended for MT translation."""
+def test_translation_worker_clean_fallback_google(mock_google_cls, synthetic_tm_db):
+    """Verify clean sentence translation without delimiter injection for MT backends."""
     mock_google = MagicMock()
     mock_google_cls.return_value = mock_google
+    mock_google.translate.return_value = "Actually doing good"
     
-    # Mock Google to return translated block containing target separator
-    mock_google.translate.return_value = "Hello.\nHow are you?.\n---\nActually doing good"
-    
-    worker = TranslationWorker(prefer_offline=False, tm_db=synthetic_tm_db, context_limit=5)
+    worker = TranslationWorker(prefer_offline=False, tm_db=synthetic_tm_db, context_limit=5, backend="google")
     worker.load()
     
-    # Create page with chronological regions (region index 2, context should be preceding regions)
-    # The synthetic DB has:
-    #   r0: manga1::0001::00 -> "こんにちは"
-    #   r1: manga1::0001::01 -> "お元気ですか"
-    # Let's run a translation for current region manga1::0001::02
     region = TextRegion(id="r02", box=BoundingBox(10, 10, 50, 50), raw_text="実際には元気です", region_index=2)
     page = PageManifest(image_filename="page01.png", width=800, height=1200, text_regions=[region], page_number=1)
     manifest = ProjectManifest(project_name="Test", pages={"page01.png": page}, manga_id="manga1")
     
-    # Let's run it
     updated_page = worker.process_page(page, manifest)
     updated_region = updated_page.text_regions[0]
     
-    # Preceding context JP sentences: "こんにちは。お元気ですか"
-    # Separator is \n---\n
-    expected_query = "こんにちは。お元気ですか\n---\n実際には元気です"
-    mock_google.translate.assert_called_once_with(expected_query)
-    
-    # verify only target translation is extracted
+    # Clean sentence without delimiter injection
+    mock_google.translate.assert_called_once_with("実際には元気です")
     assert updated_region.translated_text == "Actually doing good"
 
 
 @patch("workers.translator.GoogleTranslator")
-def test_translation_worker_context_prepend_delimiter_corrupted_fallback(mock_google_cls, synthetic_tm_db):
-    """Verify fallback to sentence tokenization when separator delimiter is missing."""
+def test_translation_worker_clean_fallback_with_dict(mock_google_cls, synthetic_tm_db):
+    """Verify common dictionary resolution precedes MT call."""
     mock_google = MagicMock()
     mock_google_cls.return_value = mock_google
     
-    # Delimiter missing, but returns multiple sentences
-    mock_google.translate.return_value = "Hello. How are you? Actually doing good."
-    
-    worker = TranslationWorker(prefer_offline=False, tm_db=synthetic_tm_db, context_limit=5)
+    worker = TranslationWorker(prefer_offline=False, tm_db=synthetic_tm_db, backend="google")
     worker.load()
     
-    region = TextRegion(id="r02", box=BoundingBox(10, 10, 50, 50), raw_text="実際には元気です", region_index=2)
+    region = TextRegion(id="r02", box=BoundingBox(10, 10, 50, 50), raw_text="はい", region_index=2)
     page = PageManifest(image_filename="page01.png", width=800, height=1200, text_regions=[region], page_number=1)
     manifest = ProjectManifest(project_name="Test", pages={"page01.png": page}, manga_id="manga1")
     
     updated_page = worker.process_page(page, manifest)
     updated_region = updated_page.text_regions[0]
     
-    # NLTK/regex sent_tokenize fallback should take the last sentence
-    assert updated_region.translated_text == "Actually doing good."
+    assert updated_region.translated_text == "Yes"
+    mock_google.translate.assert_not_called()
 
 
 @patch("workers.translator.GoogleTranslator")
@@ -133,7 +118,7 @@ def test_translation_worker_fallback_chain(mock_google_cls):
     mock_google_cls.return_value = mock_google
     mock_google.translate.side_effect = Exception("Network down")
     
-    worker = TranslationWorker(prefer_offline=False, tm_db=None)
+    worker = TranslationWorker(prefer_offline=False, tm_db=None, backend="google")
     worker.load()
     
     region = TextRegion(id="r00", box=BoundingBox(10, 10, 50, 50), raw_text="お元気ですか")

@@ -102,6 +102,9 @@ def build_translation_worker(
         tm_db=tm_db,
         fuzzy_threshold=fuzzy_threshold,
         context_limit=context_limit,
+        ollama_url=config.translation.ollama_url,
+        ollama_model=config.translation.ollama_model,
+        backend=config.translation.backend,
     )
 
 

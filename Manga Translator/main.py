@@ -245,6 +245,12 @@ def cmd_execute(args: argparse.Namespace) -> int:
                     config = load_config(project_dir)
                     if args.max_words_per_line is not None:
                         config.pipeline.max_words_per_line = args.max_words_per_line
+                    if getattr(args, "translator_backend", None) is not None:
+                        config.translation.backend = args.translator_backend
+                    if getattr(args, "ollama_url", None) is not None:
+                        config.translation.ollama_url = args.ollama_url
+                    if getattr(args, "ollama_model", None) is not None:
+                        config.translation.ollama_model = args.ollama_model
 
                     from cli.worker_factory import (
                         build_text_detector, build_ocr_worker, build_translation_worker,
@@ -636,6 +642,30 @@ Examples:
         default=None,
         metavar="FILENAME",
         help="Process only the named pages. e.g. --pages 1.jpg 2.jpg 5.jpg",
+    )
+
+    execute_parser.add_argument(
+        "--translator-backend",
+        dest="translator_backend",
+        choices=["auto", "ollama", "tm", "google", "argos"],
+        default=None,
+        help="Translation backend to use (auto, ollama, tm, google, argos)",
+    )
+
+    execute_parser.add_argument(
+        "--ollama-url",
+        dest="ollama_url",
+        type=str,
+        default=None,
+        help="Ollama server base URL (e.g. http://localhost:11434)",
+    )
+
+    execute_parser.add_argument(
+        "--ollama-model",
+        dest="ollama_model",
+        type=str,
+        default=None,
+        help="Ollama model tag to use for translation",
     )
 
     # ── Subcommand: stages ───────────────────────────────────────────────────

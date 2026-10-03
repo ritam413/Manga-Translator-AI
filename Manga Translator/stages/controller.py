@@ -110,7 +110,18 @@ class StageController:
         if manifest is None:
             raise RuntimeError("ManifestEngine has no loaded manifest. Call load_or_create() first.")
 
-        pages = list(manifest.pages.values())
+        import re
+
+        def _sort_key_natural(page: PageManifest) -> tuple:
+            page_num = getattr(page, "page_number", None)
+            if page_num is not None and isinstance(page_num, int) and page_num > 0:
+                return (0, page_num, page.image_filename)
+            m = re.search(r'(\d+)', page.image_filename)
+            if m:
+                return (1, int(m.group(1)), page.image_filename)
+            return (2, 0, page.image_filename)
+
+        pages = sorted(list(manifest.pages.values()), key=_sort_key_natural)
         pages_to_run = [p for p in pages if self._should_process(p)]
         pages_to_skip = [p for p in pages if not self._should_process(p)]
 

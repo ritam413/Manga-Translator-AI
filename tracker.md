@@ -1,5 +1,31 @@
 # Agent Handoff Log & Tracker
 
+## 2026-10-03 — Natural Numeric Page Ordering in StageController
+
+### Objective
+Ensure pipeline stages and the cross-page rolling dialogue buffer in `TranslationWorker` process pages in natural numerical story order (Page 1, 2, 3 ... 100) rather than standard ASCII string/filesystem order (`1.webp`, `100.webp`, `101.webp`...).
+
+### Changes Made
+- Updated `Manga Translator/stages/controller.py` in `StageController.run()` to sort manifest pages using a natural numeric sort key (`_sort_key_natural`) before executing workers.
+
+### Files Changed
+- `Manga Translator/stages/controller.py`
+
+### Implementation Details
+- `_sort_key_natural` checks `page.page_number` first (if set $>0$), falling back to regex numeric extraction (`r'(\d+)'`) from `page.image_filename`.
+- This ensures that when LLM translation runs with cross-page rolling dialogue memory, preceding conversational context from Page $N-1$ correctly rolls into Page $N$.
+
+### Verification
+- Tested sort logic and verified syntax in `controller.py`.
+
+### Current State
+- Pipeline execution proceeds strictly in numerical chronological chapter order.
+
+### Next Agent Instructions
+- When running CLI execution batches, pages will now automatically process in natural story order.
+
+---
+
 ## 2026-10-02 — Codebase Indexing via Repomix & Project Memory Setup
 
 ### Objective
@@ -217,3 +243,168 @@ Diagnose translation quality issues (repeated words, neural loops, story context
 
 ### Current State
 - Repository memory and tracking files are up to date. Ready for git push and execution of Ticket 1.
+
+---
+
+## 2026-10-02 — Ticket 1: Core Ollama Client & Health Probe Implementation
+
+### Objective
+Implement low-latency HTTP communication with local Ollama API (`/api/generate` and `/api/tags`) inside `TranslationWorker` with model autodiscovery, sampling controls (`temperature: 0.2`, `repeat_penalty: 1.15`), and multi-backend configuration per Ticket 1 of the Wayfinder map.
+
+### Changes Made
+- **Ollama Client in `TranslationWorker` (`workers/translator.py`)**:
+  - Added parameters `ollama_url`, `ollama_model`, and `backend` (`"auto"`, `"ollama"`, `"tm"`, `"google"`, `"argos"`) to `__init__`.
+  - Added `_probe_ollama()`: non-blocking probe querying `/api/tags` to verify Ollama server availability and discover matching local Qwen2.5 / abliterated models.
+  - Added `_generate_ollama()`: low-latency POST client querying `/api/generate` with sampling parameters (`temperature: 0.2`, `repeat_penalty: 1.15`), optional `system` prompt, and `format: "json"` support.
+  - Integrated Ollama probing and backend lifecycle management into `load()` and `unload()`.
+- **Zero-Dependency TM Fallback (`finetuning/translation_memory.py`)**:
+  - Replaced hard dependency on `nltk` with stdlib Levenshtein edit distance fallback when `nltk` is absent.
+- **Unit & Integration Test Suite (`tests/test_stage8.py`)**:
+  - Added `TestOllamaClient` suite testing `_probe_ollama` (success & failure) and `_generate_ollama` (success & timeout/failure).
+  - Updated `test_load_no_backends_raises` to assert `RuntimeError` when all backends (Ollama, Argos, Google) are inactive.
+
+### Files Changed
+- `Manga Translator/workers/translator.py` (modified)
+- `Manga Translator/finetuning/translation_memory.py` (modified)
+- `Manga Translator/tests/test_stage8.py` (modified)
+- `features_implemented.md` (updated)
+- `tracker.md` (updated)
+
+### Implementation Details
+- Standard library `urllib.request` and `json` are used for zero extra HTTP dependencies per the `/ponytail` ladder.
+- Model discovery matches `self._ollama_model` or `qwen2.5` in local models list.
+- Generation timeout defaults to `60.0s` to comfortably allow VRAM cold-weight loading on the GTX 1050 Ti.
+
+### Verification
+- **Unit Tests**: `python -m unittest tests/test_stage8.py` — passed (36/36 tests, 0 failures, 0 errors).
+- **Live Model Probe**: Verified live connection to local Ollama on port 11434 (`ollama=True`, detected `richardyoung/qwen2.5-3b-instruct-abliterated:latest`).
+- **Live Generation**: Verified real inference with Ollama (`"Translate this Japanese sentence to English directly: こんにちは、世界！"` -> `'Hello, world!'`).
+
+### Current State
+- Ticket 1 is complete and tested.
+- `TranslationWorker` is ready to accept page-level batch prompt construction and JSON response parsing (Ticket 2).
+
+---
+
+## 2026-10-02 — Ticket 2: Page-Level JSON Batch Prompt & Robust Multi-Tier Parser
+
+### Objective
+Implement page-level JSON batch translation in `TranslationWorker` allowing all speech bubbles on a manga page to be translated simultaneously in a single structured JSON pass (~1.8s/page) with 4-tier fallback parsing and per-bubble resolution for dropped keys.
+
+### Changes Made
+- **Page-Level Batch Translation Engine (`workers/translator.py`)**:
+  - Implemented `_translate_page_batch_ollama(batch_input)` with tailored prompt enforcing English output formatting and colloquial nuance.
+  - Implemented static `_parse_json_batch_response(text)` with 4-tier fallback:
+    - *Tier 1*: Direct `json.loads`
+    - *Tier 2*: Markdown fenced block extraction (```` ```json ... ``` ````)
+    - *Tier 3*: Substring boundary extraction (first `{` to last `}`)
+    - *Tier 4*: Line-by-line regex key-value extraction for quoted pairs
+  - Updated `process_page()`:
+    - Pre-evaluates exact TM matches.
+    - Gathers remaining page speech bubbles into a dictionary `{region_id: raw_text}` and executes a single Ollama batch translation pass.
+    - Maps translated English dialogue back to regions with `translation_source="ollama_batch"`.
+    - Automatically falls back to fuzzy TM and single-bubble neural MT for any dropped keys or non-English responses.
+- **Unit Testing Suite (`tests/test_stage8.py`)**:
+  - Added `TestOllamaBatchTranslation` testing:
+    - Tier 1 direct JSON parsing.
+    - Tier 2 Markdown block extraction.
+    - Tier 3 Substring object extraction.
+    - Tier 4 Line-by-line regex extraction.
+    - Empty and None inputs.
+    - Full `process_page` batch flow.
+    - Partial dropped key fallback resolution.
+
+### Files Changed
+- `Manga Translator/workers/translator.py` (modified)
+- `Manga Translator/tests/test_stage8.py` (modified)
+- `features_implemented.md` (updated)
+- `tracker.md` (updated)
+
+### Implementation Details
+- Used pure standard library (`re`, `json`, `urllib.request`) adhering to `/ponytail` ladder.
+- Prompt specifically constrains output to English (`"Output MUST be in English only (NO Japanese, NO Chinese)"`) to prevent multilingual drift.
+
+### Verification
+- **Unit Tests**: `python -m unittest tests/test_stage8.py` passed (`44/44 tests OK`).
+- **Live Batch Test**: Verified live batch translation on 3 bubbles simultaneously in ~1.8s:
+  - Input: `{'r0001': 'おはようございます、先輩！', 'r0002': '今日はいい天気ですね。', 'r0003': '一緒に帰りませんか？'}`
+  - Output: `{'r0001': 'Good morning, Senpai!', 'r0002': "It's nice and sunny today, isn't it?", 'r0003': "Why don't we go home together?"}`
+
+### Current State
+- Tickets 1 & 2 are complete and verified.
+- Pipeline translates full manga pages in a single fast JSON call via Ollama with full resilience.
+
+---
+
+## 2026-10-02 — Ticket 3: Rolling Dialogue Buffer & Glossary Memory (100-Page Consistency)
+
+### Objective
+Maintain character name consistency, tone, and pronoun reference across 100+ pages via sliding dialogue buffer and dynamic TM glossary injection.
+
+### Changes Made
+- Added `get_glossary(manga_id, limit)` method to `TranslationMemoryDB` (`finetuning/translation_memory.py`).
+- Added `_rolling_dialogue` FIFO memory buffer and `_max_rolling_context` to `TranslationWorker` in `workers/translator.py`.
+- Implemented `_build_ollama_prompt` dynamically injecting series glossary items and previous dialogue pairs into the localization prompt.
+- Updated `process_page` to automatically append validated page dialogue pairs to `_rolling_dialogue`.
+- Updated `unload()` to flush memory buffers cleanly between runs.
+
+### Verification
+- `python -m unittest tests/test_stage8.py` passed (47/47 tests OK).
+- Verified live prompt generation and glossary enforcement with Ollama.
+
+---
+
+## 2026-10-02 — Ticket 4, 5 & 6: Clean NMT Decoupling, CLI Settings, & Verification Suite
+
+### Objective
+1. **Ticket 4**: Completely decouple Seq2Seq NMT models (Argos/Google) from multi-line delimiter injections (`\n---\n`) to eliminate word repetition loops. Replace `_translate_with_context_fallback` with direct clean sentence translation (`_translate_with_clean_fallback`).
+2. **Ticket 5**: Expose `--ollama-model`, `--ollama-url`, and `--translator-backend` options across CLI commands and `TranslationSettings` TOML configuration.
+3. **Ticket 6**: Build and execute automated test suite and live end-to-end verification.
+
+### Changes Made
+- **Clean NMT Decoupling (`workers/translator.py`)**:
+  - Implemented `_translate_with_clean_fallback(text, region_id, image_filename)`.
+  - Updated `_translate_with_fallback` to process clean sentences directly without delimiter string pollution.
+  - Fixed Tier 4 regex quote parsing in `_parse_json_batch_response` to use backreferences (`\2`), preserving apostrophes in English text (e.g. `"Let's go"`).
+  - Deprecated `_translate_with_context_fallback` by forwarding it to `_translate_with_clean_fallback`.
+- **CLI Configuration & Factory (`cli/config/models.py`, `cli/config/defaults.py`, `cli/worker_factory.py`, `main.py`)**:
+  - Added `backend`, `ollama_url`, and `ollama_model` to `TranslationSettings`.
+  - Updated `DEFAULT_CONFIG_TOML` with translation backend defaults.
+  - Updated `build_translation_worker` to propagate `ollama_url`, `ollama_model`, and `backend`.
+  - Added `--translator-backend`, `--ollama-url`, and `--ollama-model` arguments to `manga-translator execute` CLI parser.
+- **Verification Suite & Tests (`tests/test_translator_ollama.py`, `tests/test_stage8.py`, `tests/integration/test_integration_tm_translate.py`)**:
+  - Created `tests/test_translator_ollama.py` testing batching, 4-tier parser, rolling buffer evolution, clean fallback, and CLI factory integration.
+  - Updated integration tests in `test_integration_tm_translate.py` to test clean fallback without delimiters.
+  - All unit test suites passing (57/57 tests in stage 8 + ollama suites, 10/10 in TM integration).
+
+### Files Changed
+- `Manga Translator/workers/translator.py` (modified)
+- `Manga Translator/cli/config/models.py` (modified)
+- `Manga Translator/cli/config/defaults.py` (modified)
+- `Manga Translator/cli/worker_factory.py` (modified)
+- `Manga Translator/main.py` (modified)
+- `Manga Translator/tests/test_stage8.py` (modified)
+- `Manga Translator/tests/test_translator_ollama.py` (created)
+- `Manga Translator/tests/integration/test_integration_tm_translate.py` (modified)
+- `features_implemented.md` (updated)
+- `tracker.md` (updated)
+
+### Verification
+- `python -m unittest tests/test_stage8.py tests/test_translator_ollama.py` — Passed (`57/57 tests OK`).
+- `python -m pytest tests/integration/test_integration_tm_translate.py` — Passed (`10/10 tests OK`).
+- `python -m pytest tests/test_build_translation_memory.py` — Passed (`9/9 tests OK`).
+- `python main.py execute --help` — Verified CLI flags `--translator-backend`, `--ollama-url`, `--ollama-model`.
+- Live GPU Batch Execution with glossary & rolling context:
+  - Input: `{'r0001': 'あの魔法使いの先輩、また遅刻ですね。', 'r0002': '急いで教室に行きましょう！'}`
+  - Output: `{'r0001': 'That sorcerer senpai is late again!', 'r0002': "Let's hurry to class!"}`
+  - Verified zero repetition loops and accurate glossary mapping (`先輩` -> `senpai`, `魔法使い` -> `sorcerer`).
+
+### Current State
+- **All Tickets 1 through 6 in the Wayfinder Map are 100% COMPLETE and verified.**
+- Translation pipeline supports high-throughput page-level JSON batching on local GTX 1050 Ti via Ollama with cross-page memory, clean NMT fallbacks, and full CLI/TOML configurability.
+
+### Next Agent Instructions
+1. The translation engine is fully upgraded and ready for production use.
+2. To run translation via CLI:
+   `python main.py execute --stage translate --translator-backend ollama --ollama-model richardyoung/qwen2.5-3b-instruct-abliterated:latest`
+3. If new models or remote Ollama URLs are used, configure via `.manga-translator/config.toml` or pass `--ollama-url` / `--ollama-model`.

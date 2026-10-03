@@ -5,8 +5,26 @@ import unicodedata
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
-import nltk
-from nltk.metrics import edit_distance
+try:
+    import nltk
+    from nltk.metrics import edit_distance
+except ImportError:  # pragma: no cover
+    def edit_distance(s1: str, s2: str) -> int:
+        """Pure Python Levenshtein distance fallback when nltk is not installed."""
+        if len(s1) < len(s2):
+            return edit_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        prev_row = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            curr_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = prev_row[j + 1] + 1
+                deletions = curr_row[j] + 1
+                substitutions = prev_row[j] + (c1 != c2)
+                curr_row.append(min(insertions, deletions, substitutions))
+            prev_row = curr_row
+        return prev_row[-1]
 
 
 @dataclass
@@ -289,4 +307,25 @@ class TranslationMemoryDB:
         for j, (e, score) in best_mappings.items():
             vocab[j] = e
 
+        return vocab
+
+    def get_glossary(self, manga_id: str, limit: int = 15) -> dict[str, str]:
+        """Retrieve active bilingual terminology and character names for a series."""
+        vocab: dict[str, str] = {}
+        # 1. Target series specific vocabulary
+        if manga_id in self.manga_vocab:
+            for k, v in list(self.manga_vocab[manga_id].items())[:limit]:
+                vocab[k] = v
+
+        # 2. Global vocabulary if limit has remaining capacity
+        if len(vocab) < limit:
+            for m_id, v_dict in self.manga_vocab.items():
+                if m_id != manga_id:
+                    for k, v in v_dict.items():
+                        if k not in vocab:
+                            vocab[k] = v
+                        if len(vocab) >= limit:
+                            break
+                if len(vocab) >= limit:
+                    break
         return vocab

@@ -59,6 +59,9 @@ class TranslationSettings(BaseModel):
     """Translation language settings."""
     source_language: str = "ja"
     target_language: str = "en"
+    backend: str = "auto"  # "auto", "ollama", "tm", "google", "argos"
+    ollama_url: str = "http://localhost:11434"
+    ollama_model: str = "richardyoung/qwen2.5-3b-instruct-abliterated:latest"
 
 
 class FinetuningSettings(BaseModel):

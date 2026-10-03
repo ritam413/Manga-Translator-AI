@@ -96,12 +96,27 @@ FAST_RECALL_REGISTRY = {
     },
     "start": "cd 'e:\\u torrentz\\MangaTranslator FUll STACK\\webui'; .\\start.ps1",
     "server": "cd 'e:\\u torrentz\\MangaTranslator FUll STACK\\webui'; .\\start.ps1",
+    "ollama": {
+        "url": "http://localhost:11434",
+        "default_model": "richardyoung/qwen2.5-3b-instruct-abliterated:latest",
+        "temperature": 0.2,
+        "repeat_penalty": 1.15,
+        "speed": "~1.8s/page on GTX 1050 Ti",
+        "features": ["Whole-page JSON batch translation", "Rolling dialogue memory", "Series glossary injection"]
+    },
+    "translation": {
+        "primary_backend": "ollama",
+        "supported_backends": ["auto", "ollama", "tm", "google", "argos"],
+        "batch_parser": "4-Tier robust fallback (Direct JSON -> Markdown fence -> Substring boundary -> Regex KV with backref)",
+        "memory": "FIFO rolling dialogue buffer + TranslationMemoryDB series glossary",
+        "clean_fallback": "Decoupled NMT sentence translation without delimiter injection"
+    },
     "pipeline_stages": [
-        "detect-text (EasyOCR bounding boxes)",
-        "ocr (MangaOCR Japanese transcription)",
-        "translate (ArgosTranslate offline / online translation)",
-        "inpaint (OpenCV background inpainting)",
-        "typeset (PIL English text layout & rendering)"
+        "detect-text (EasyOCR bounding boxes & box merging)",
+        "ocr (MangaOCR Japanese transcription with AutoImageProcessor)",
+        "translate (Ollama Local LLM batching / TM / Argos / Google)",
+        "inpaint (OpenCV / Contour background inpainting)",
+        "typeset (PIL English text layout & Bangers rendering)"
     ],
     "contracts": {
         "manifest": "project_manifest.json (single source of truth for page states, blocks, coordinates)"
@@ -115,6 +130,21 @@ FAST_RECALL_REGISTRY = {
 
 # Domain invariants for semantic vector recall
 DEFAULT_INVARIANTS = [
+    {
+        "category": "translation_engine",
+        "content": "Translation Engine uses local Ollama (richardyoung/qwen2.5-3b-instruct-abliterated:latest) on http://localhost:11434 with whole-page JSON batch translation (~1.8s/page on GTX 1050 Ti) and 4-tier fallback parsing.",
+        "metadata": {"type": "llm_engine", "source": "context.md"}
+    },
+    {
+        "category": "story_consistency",
+        "content": "Cross-page 100-page story consistency is maintained via a sliding FIFO dialogue buffer (_rolling_dialogue) and active Translation Memory series glossary injection (get_glossary).",
+        "metadata": {"type": "memory", "source": "context.md"}
+    },
+    {
+        "category": "nmt_fallbacks",
+        "content": "Seq2Seq NMT fallbacks (ArgosTranslate, GoogleTranslator) use clean sentence translation (_translate_with_clean_fallback) without delimiter injections to prevent token repetition loops.",
+        "metadata": {"type": "fallback", "source": "context.md"}
+    },
     {
         "category": "startup",
         "content": "Startup Option 1 (1-Click): Run `cd 'e:\\u torrentz\\MangaTranslator FUll STACK\\webui'; .\\start.ps1` to launch Engine (:8001), Backend (:8000), and Frontend (:3000).",
@@ -142,12 +172,12 @@ DEFAULT_INVARIANTS = [
     },
     {
         "category": "pipeline_stages",
-        "content": "Pipeline stages in order: 1. detect-text (EasyOCR), 2. ocr (MangaOCR), 3. translate (ArgosTranslate offline / online APIs), 4. inpaint (OpenCV / background cleaner), 5. typeset (PIL / font wrapping).",
+        "content": "Pipeline stages in order: 1. detect-text (EasyOCR), 2. ocr (MangaOCR), 3. translate (Ollama Local LLM batching / TM / Argos / Google), 4. inpaint (OpenCV / background cleaner), 5. typeset (PIL / font wrapping).",
         "metadata": {"type": "pipeline", "source": "context.md"}
     },
     {
         "category": "ports",
-        "content": "Service Port Allocations: Frontend UI on port 3000, Backend API Gateway on port 8000, Translation Engine API on port 8001.",
+        "content": "Service Port Allocations: Frontend UI on port 3000, Backend API Gateway on port 8000, Translation Engine API on port 8001, Ollama Local LLM on port 11434.",
         "metadata": {"type": "networking", "source": "context.md"}
     },
     {

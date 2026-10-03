@@ -75,4 +75,8 @@ max_words_per_line = 0
 [translation]
 source_language = "ja"
 target_language = "en"
+# Backend options: auto | ollama | tm | google | argos
+backend = "auto"
+ollama_url = "http://localhost:11434"
+ollama_model = "richardyoung/qwen2.5-3b-instruct-abliterated:latest"
 """
